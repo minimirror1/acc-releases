@@ -1,0 +1,91 @@
+# Installed in minimirror1/acc-releases (NOT active in acc-desktop; see release-relay/README.md).
+#
+# acc-desktop's release.yml / promote.yml push a one-commit branch `publish/...` here with a deploy
+# key (which cannot call the Releases API). This workflow turns it into GitHub Releases with this
+# repo's own token and deletes the branch:
+#
+#   publish.json                   {"tag": "v1.1.20-rc.1" | null, "channel": "stable" | "canary"}
+#   release/*                      installer + .sig -> release <tag> (once per version)
+#   channel/latest.json(.minisig)  -> fixed-tag release <channel>, assets replaced
+#
+# The client endpoints are releases/download/<channel>/latest.json (acc-update DEFAULT_ENDPOINTS /
+# CANARY_ENDPOINTS). Nothing here signs anything; clients verify every byte with minisign.
+name: Publish relay
+
+on:
+  push:
+    branches:
+      - "publish/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Checkout the relay branch
+        uses: actions/checkout@v4
+
+      - name: Read publish.json
+        id: spec
+        run: |
+          set -euo pipefail
+          channel=$(jq -er '.channel' publish.json)
+          tag=$(jq -r '.tag // empty' publish.json)
+          case "$channel" in
+            stable|canary) ;;
+            *) echo "::error::unknown channel '$channel'"; exit 1 ;;
+          esac
+          if [ -n "$tag" ] && ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::bad tag '$tag'"; exit 1
+          fi
+          for file in channel/latest.json channel/latest.json.minisig; do
+            if [ ! -s "$file" ]; then echo "::error::$file is missing"; exit 1; fi
+          done
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # First the installer, then the manifest that points at it.
+      - name: Version release
+        if: steps.spec.outputs.tag != ''
+        env:
+          TAG: ${{ steps.spec.outputs.tag }}
+          CHANNEL: ${{ steps.spec.outputs.channel }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release/*)
+          if [ "${#assets[@]}" -eq 0 ]; then echo "::error::no release/ assets for $TAG"; exit 1; fi
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            if [ "$CHANNEL" = canary ]; then flags=(--prerelease --latest=false); else flags=(--latest); fi
+            gh release create "$TAG" "${assets[@]}" --target "$DEFAULT_BRANCH" --title "ACC $TAG" \
+              --notes "Signed ACC installer ($CHANNEL). Installed PCs update from the '$CHANNEL' release's latest.json." \
+              "${flags[@]}"
+          fi
+
+      - name: Channel manifest
+        env:
+          CHANNEL: ${{ steps.spec.outputs.channel }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$CHANNEL" > /dev/null 2>&1; then
+            gh release create "$CHANNEL" --target "$DEFAULT_BRANCH" --title "ACC $CHANNEL channel" \
+              --notes "Update manifest of the ACC $CHANNEL channel (latest.json + latest.json.minisig). Replaced by every publish; do not delete." \
+              --prerelease --latest=false
+          fi
+          gh release upload "$CHANNEL" channel/latest.json channel/latest.json.minisig --clobber
+
+      - name: Delete the relay branch
+        run: git push origin --delete "$GITHUB_REF_NAME"
